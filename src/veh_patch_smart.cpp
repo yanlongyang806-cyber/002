@@ -1,17 +1,16 @@
-\
 #include <windows.h>
 #include <fstream>
 #include <sstream>
 #include <string>
 
-// 固定日志路径（你之前选择了写到 Servers 目录）
-static const char* kLogPath = "D:\\\\SPP-LegionV2\\\\Servers\\\\veh_patch.log";
+// 固定日志路径
+static const char* kLogPath = "D:\\SPP-LegionV2\\Servers\\veh_patch.log";
 
 // 主模块信息
 static DWORD64 gModuleBase = 0;
 static DWORD64 gModuleSize = 0;
 
-// 简单日志
+// 写日志
 static void WriteLog(const std::string& msg) {
     std::ofstream ofs(kLogPath, std::ios::app);
     if (!ofs.is_open()) return;
@@ -27,7 +26,7 @@ static std::string HexU64(DWORD64 v) {
     return oss.str();
 }
 
-// 读取 PE SizeOfImage（无需额外库）
+// 获取模块大小
 static DWORD64 GetModuleSizeFromPE(DWORD64 base) {
     if (!base) return 0;
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
@@ -37,39 +36,37 @@ static DWORD64 GetModuleSizeFromPE(DWORD64 base) {
     return static_cast<DWORD64>(nt->OptionalHeader.SizeOfImage);
 }
 
-// VEH：捕获访问违规，尽量跳过导致崩溃的指令
+// VEH 异常处理
 static LONG CALLBACK SmartVehHandler(EXCEPTION_POINTERS* ep) {
-    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+        return EXCEPTION_CONTINUE_SEARCH;
 
-    const auto code = ep->ExceptionRecord->ExceptionCode;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION &&
         code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED &&
         code != EXCEPTION_ILLEGAL_INSTRUCTION) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    const DWORD64 ripBefore = ep->ContextRecord->Rip;
-    const DWORD64 crashAddr = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
+    DWORD64 crashAddr = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
+    DWORD64 ripBefore = ep->ContextRecord->Rip;
 
-    // 仅在 worldserver.exe 主模块范围内尝试“跳过”
+    // 仅对 worldserver.exe 模块范围内的异常处理
     if (gModuleBase && gModuleSize &&
         crashAddr >= gModuleBase && crashAddr < (gModuleBase + gModuleSize)) {
 
-        // 保险起见，默认前进 2 字节（常见短指令大小）。
-        // 如果你的目标指令更长，可以在这里调到 3/5 等。
-        DWORD64 advance = 2;
+        DWORD64 advance = 2; // 默认跳过 2 字节
         ep->ContextRecord->Rip += advance;
 
-        WriteLog(std::string("[VEH] 捕获异常(code=") +
-                 std::to_string(code) +
+        WriteLog("[VEH] 捕获异常(code=" + std::to_string(code) +
                  ") @" + HexU64(crashAddr) +
-                 " RIP " + HexU64(ripBefore) + " -> " + HexU64(ep->ContextRecord->Rip) +
-                 "，已尝试跳过指令继续执行。");
+                 " RIP " + HexU64(ripBefore) + " -> " +
+                 HexU64(ep->ContextRecord->Rip) +
+                 "，已跳过可疑指令继续执行。");
 
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    // 非主模块/不满足条件，交由系统处理
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -77,12 +74,18 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hMod);
 
+        // 🔔 弹窗确认 DLL 是否加载
+        MessageBoxA(NULL, "✅ veh_patch_smart.dll 已加载到 worldserver.exe", "VEH Patch", MB_OK | MB_ICONINFORMATION);
+
+        // 写入初始化日志
+        WriteLog("[DllMain] veh_patch_smart.dll 注入启动中...");
+
         HMODULE hMain = GetModuleHandleA("worldserver.exe");
         if (hMain) {
             gModuleBase = reinterpret_cast<DWORD64>(hMain);
             gModuleSize = GetModuleSizeFromPE(gModuleBase);
-            WriteLog(std::string("[DllMain] veh_patch_smart.dll 注入成功。worldserver.exe 基址=") +
-                     HexU64(gModuleBase) + " 大小=" + std::to_string(gModuleSize) + " bytes");
+            WriteLog("[DllMain] 获取 worldserver.exe 基址: " + HexU64(gModuleBase) +
+                     " 大小=" + std::to_string(gModuleSize) + " bytes");
 
             PVOID handle = AddVectoredExceptionHandler(1, SmartVehHandler);
             if (handle) {
