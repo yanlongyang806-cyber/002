@@ -2,31 +2,34 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <iomanip>
 
-// 日志路径（你指定的目录）
+// 日志路径（根据你当前环境）
 static const char* kLogPath = "D:\\\\SPP-LegionV2\\\\Servers\\\\veh_patch.log";
 
+// 主模块信息
 static DWORD64 gModuleBase = 0;
 static DWORD64 gModuleSize = 0;
 
-// 日志函数
+// 写日志函数
 static void WriteLog(const std::string& msg) {
     std::ofstream ofs(kLogPath, std::ios::app);
     if (!ofs.is_open()) return;
     SYSTEMTIME st; GetLocalTime(&st);
     ofs << "[" << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
-        << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "] "
+        << std::setw(2) << std::setfill('0') << st.wHour << ":"
+        << std::setw(2) << std::setfill('0') << st.wMinute << ":"
+        << std::setw(2) << std::setfill('0') << st.wSecond << "] "
         << msg << std::endl;
 }
 
-// 十六进制打印
-static std::string HexU64(DWORD64 v) {
+static std::string Hex(DWORD64 v) {
     std::ostringstream oss;
     oss << "0x" << std::hex << v;
     return oss.str();
 }
 
-// 获取 PE 大小
+// 获取 PE 映像大小
 static DWORD64 GetModuleSizeFromPE(DWORD64 base) {
     if (!base) return 0;
     auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
@@ -36,71 +39,75 @@ static DWORD64 GetModuleSizeFromPE(DWORD64 base) {
     return static_cast<DWORD64>(nt->OptionalHeader.SizeOfImage);
 }
 
-// ✅ 智能检测指令长度（简单 x86-64 支持）
-static size_t GuessInstructionLength(BYTE* code) {
-    // 简化版：检查常见指令前缀和长度（不需要 disasm 库）
-    BYTE first = code[0];
-    if ((first & 0xF0) == 0x40) return 2;   // REX + 操作码
-    if (first == 0xE8 || first == 0xE9) return 5; // call / jmp rel32
-    if (first == 0x90) return 1;            // nop
-    if ((first & 0xF8) == 0x50) return 1;   // push/pop rax-rdi
-    if ((first & 0xF8) == 0x58) return 1;
-    return 2; // 默认安全值
-}
-
 // VEH 异常处理
 static LONG CALLBACK SmartVehHandler(EXCEPTION_POINTERS* ep) {
-    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
 
-    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    auto rec = ep->ExceptionRecord;
+    auto ctx = ep->ContextRecord;
+    DWORD code = rec->ExceptionCode;
+
+    // 只处理访问违规、非法指令等
     if (code != EXCEPTION_ACCESS_VIOLATION &&
         code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED &&
         code != EXCEPTION_ILLEGAL_INSTRUCTION) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    DWORD64 crashAddr = (DWORD64)ep->ExceptionRecord->ExceptionAddress;
-    DWORD64 ripBefore = ep->ContextRecord->Rip;
+    DWORD64 crashAddr = (DWORD64)rec->ExceptionAddress;
+    DWORD threadId = GetCurrentThreadId();
 
+    std::ostringstream log;
+    log << "[VEH] 捕获异常 (code=0x" << std::hex << code << ") @ " << Hex(crashAddr)
+        << " | Thread=" << threadId;
+
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        ULONG_PTR type = rec->ExceptionInformation[0];
+        ULONG_PTR addr = rec->ExceptionInformation[1];
+        log << " | Access=" << (type == 0 ? "READ" : (type == 1 ? "WRITE" : "EXECUTE"))
+            << " | Addr=" << Hex(addr);
+    }
+
+    // 输出寄存器状态（方便调试）
+    log << "\n   RIP=" << Hex(ctx->Rip)
+        << " RAX=" << Hex(ctx->Rax)
+        << " RBX=" << Hex(ctx->Rbx)
+        << " RCX=" << Hex(ctx->Rcx)
+        << " RDX=" << Hex(ctx->Rdx)
+        << " RSI=" << Hex(ctx->Rsi)
+        << " RDI=" << Hex(ctx->Rdi);
+
+    // 仅在主模块内才尝试跳过
     if (gModuleBase && gModuleSize &&
-        crashAddr >= gModuleBase && crashAddr < (gModuleBase + gModuleSize)) {
+        crashAddr >= gModuleBase && crashAddr < gModuleBase + gModuleSize) {
 
-        size_t advance = GuessInstructionLength((BYTE*)crashAddr);
-        ep->ContextRecord->Rip += advance;
-
-        WriteLog("[VEH] 捕获异常 code=" + std::to_string(code) +
-                 " @" + HexU64(crashAddr) +
-                 " RIP " + HexU64(ripBefore) +
-                 " -> " + HexU64(ep->ContextRecord->Rip) +
-                 " 已智能跳过 " + std::to_string(advance) + " 字节。");
-
+        ctx->Rip += 2; // 默认跳过 2 字节
+        log << "\n   ✅ 已调整 RIP，跳过异常指令，继续执行。新 RIP=" << Hex(ctx->Rip);
+        WriteLog(log.str());
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    log << "\n   ⚠️ 不在主模块范围内，未尝试跳过。";
+    WriteLog(log.str());
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// DLL 入口
 BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hMod);
-
         HMODULE hMain = GetModuleHandleA("worldserver.exe");
         if (hMain) {
             gModuleBase = (DWORD64)hMain;
             gModuleSize = GetModuleSizeFromPE(gModuleBase);
+            WriteLog("[DllMain] 🚀 veh_patch_smart.dll 注入成功，worldserver.exe 基址=" + Hex(gModuleBase) +
+                     " 大小=" + std::to_string(gModuleSize) + " bytes");
 
-            WriteLog("[DllMain] veh_patch_smart.dll 注入成功。worldserver.exe 基址=" +
-                     HexU64(gModuleBase) + " 大小=" + std::to_string(gModuleSize) + " bytes");
-
-            if (AddVectoredExceptionHandler(1, SmartVehHandler)) {
+            if (AddVectoredExceptionHandler(1, SmartVehHandler))
                 WriteLog("[DllMain] ✅ VEH 异常处理程序安装完成。");
-            } else {
+            else
                 WriteLog("[DllMain] ❌ VEH 安装失败！");
-            }
         } else {
-            WriteLog("[DllMain] ❌ 获取 worldserver.exe 模块失败，VEH 未安装。");
+            WriteLog("[DllMain] ❌ 获取 worldserver.exe 模块失败！");
         }
     }
     return TRUE;
